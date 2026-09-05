@@ -28,6 +28,30 @@ ENERGIES = [
 ]
 REQUIRED = [">=10 MeV", ">=30 MeV", ">=50 MeV", ">=100 MeV", ">=500 MeV"]
 
+# Canales DIFERENCIALES que publica SWPC: una fila por canal, identificado por
+# su nombre `channel` (P1..P10). El rango de energia viaja en la propia fila
+# (`energy`, en keV y como intervalo) y se conserva por muestra; `yaw_flip`
+# indica que sensor mira a donde y tambien se conserva por muestra.
+DIFF_CHANNELS = [
+    "P1", "P2A", "P2B", "P3", "P4", "P5", "P6",
+    "P7", "P8A", "P8B", "P8C", "P9", "P10",
+]
+DIFF_ENERGIES = {
+    "P1": "1020-1860 keV",
+    "P2A": "1860-3200 keV",
+    "P2B": "3200-6400 keV",
+    "P3": "6.4-12 MeV",
+    "P4": "12-24 MeV",
+    "P5": "24-47 MeV",
+    "P6": "47-92 MeV",
+    "P7": "92-180 MeV",
+    "P8A": "180-300 MeV",
+    "P8B": "300-500 MeV",
+    "P8C": "500-800 MeV",
+    "P9": "0.8-1.4 GeV",
+    "P10": "1.4-2.5 GeV",
+}
+
 SLOT_STEP = 5  # minutos
 _UTC = datetime.timezone.utc
 
@@ -93,15 +117,56 @@ def build_feed(days, satellites, flux=1.0, holes=None, extra=None):
     return rows
 
 
+def diff_rows_for(ts, satellite, flux, yaw_flip=0):
+    """Las 13 filas DIFERENCIALES de un slot (un canal por fila, formato SWPC)."""
+    rows = []
+    for channel in DIFF_CHANNELS:
+        rows.append({
+            "time_tag": ts,
+            "satellite": satellite,
+            "channel": channel,
+            "energy": DIFF_ENERGIES[channel],
+            "flux": flux,
+            "yaw_flip": yaw_flip,
+        })
+    return rows
+
+
+def build_diff_feed(days, satellites, flux=1.0, holes=None, extra=None,
+                    yaw_flip=0):
+    """Feed DIFERENCIAL sintetico (lista de filas con canal/energy/yaw_flip).
+
+    Misma estructura de cobertura que build_feed: holes es un set de
+    (day, ts) -> se omiten TODAS las filas del slot.
+    """
+    holes = holes or set()
+    rows = []
+    for day in days:
+        for ts in day_slots(day):
+            for sat in satellites:
+                if (day, ts) in holes:
+                    continue
+                rows.extend(diff_rows_for(ts, sat, flux, yaw_flip))
+    if extra:
+        rows.extend(extra)
+    return rows
+
+
 class Fetcher:
     """Fetcher inyectable: URL del feed -> filas (None simula caida).
 
-    Cualquier otra URL (p.ej. un hipotetico instrument-sources.json) es un
-    error de red: el recolector no debe pedir nada fuera de los feeds.
+    `feeds` sirve los feeds INTEGRALES y `diff_feeds` (opcional) los
+    DIFERENCIALES, cada uno con el mismo reparto {(kind, role): filas}. Si
+    `diff_feeds` es None, toda URL diferencial es un error de red (caida del
+    diferencial). Cualquier otra URL (p.ej. un hipotetico
+    instrument-sources.json) es un error de red: el recolector no debe pedir
+    nada fuera de los feeds.
     """
 
-    def __init__(self, feeds):
+    def __init__(self, feeds, diff_feeds=None):
         self.feeds = dict(feeds)     # {(kind, role): rows o None(->error)}
+        self.diff_feeds = (dict(diff_feeds) if diff_feeds is not None
+                           else None)
         self.calls = []
 
     def __call__(self, url):
@@ -112,6 +177,13 @@ class Fetcher:
                     raise OSError("red simulada: %s/%s caido"
                                   % (kind, role))
                 return rows
+        if self.diff_feeds is not None:
+            for (kind, role), rows in self.diff_feeds.items():
+                if url == collect.DIFF_FEED_URLS[(kind, role)]:
+                    if rows is None:
+                        raise OSError("red simulada: %s/%s caido"
+                                      % (kind, role))
+                    return rows
         raise OSError("URL desconocida: %s" % url)
 
 
@@ -645,9 +717,11 @@ class TestSatelliteFromFeed(CollectorTestCase):
         # Ninguna peticion fuera de los feeds; en particular ninguna a
         # instrument-sources.json.
         self.assertTrue(fetcher.calls)
+        known = set(collect.FEED_URLS.values())
+        known |= set(collect.DIFF_FEED_URLS.values())
         for url in fetcher.calls:
             self.assertNotIn("instrument-sources", url)
-            self.assertIn(url, collect.FEED_URLS.values())
+            self.assertIn(url, known)
         content = self._day_file("2026-09-05")
         self.assertEqual(content["satellites"], [18])
         manifest = self._manifest()
@@ -711,3 +785,454 @@ class TestSentinelFlux(CollectorTestCase):
                 self.assertGreaterEqual(
                     flux, 0.0,
                     "centinela archivado como flujo real en %s" % energy)
+
+
+class DiffCollectorTestCase(CollectorTestCase):
+    """Escenario del dominio DIFERENCIAL (canales P1..P10, fichero -diff.json).
+
+    Reutiliza el escenario integral de CollectorTestCase y le anade el feed
+    diferencial equivalente (misma ventana de 7 dias y mismo satelite 18), de
+    modo que una sola corrida archiva los DOS dominios sin pisarse.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.diff_feeds = {
+            ("7d", "primary"): build_diff_feed(self.days, [18], flux=1.0),
+            ("6h", "primary"): build_diff_feed(
+                [], [18], extra=[r for ts in slot_times(
+                    "2026-09-05T18:30:00Z", "2026-09-06T00:25:00Z")
+                    for r in diff_rows_for(ts, 18, 1.0)]),
+        }
+
+    # -- utilidades del dominio diferencial -------------------------------
+
+    def diff_day_path(self, day):
+        d = datetime.date.fromisoformat(day)
+        return os.path.join(self.root, "solar", "%04d" % d.year,
+                            "%02d" % d.month, "%s-diff.json" % day)
+
+    def _diff_file(self, day):
+        return read_json(self.diff_day_path(day))
+
+    def _fetcher(self, feeds=None, diff_feeds=None):
+        feeds = feeds if feeds is not None else self.feeds
+        diff = self.diff_feeds if diff_feeds is None else diff_feeds
+        return Fetcher(feeds, diff_feeds=diff)
+
+    def _run(self, feeds=None, diff_feeds=None, now=None):
+        fetcher = self._fetcher(feeds=feeds, diff_feeds=diff_feeds)
+        rc = run_once(self.root, fetcher, now or self.now)
+        self.assertEqual(rc, 0)
+        return fetcher
+
+    def _diff_incomplete(self):
+        diff = self._manifest().get("differential") or {}
+        return {e["day"]: e for e in diff.get("incomplete_days", [])}
+
+
+class TestDiffChannelsInFile(DiffCollectorTestCase):
+    """Los 13 canales diferenciales llegan al fichero -diff.json."""
+
+    def test_thirteen_channels_reach_the_diff_file(self):
+        self._run()
+        content = self._diff_file("2026-09-05")
+        self.assertTrue(content["complete"])
+        self.assertEqual(content["kind"], "differential")
+        self.assertEqual(content["schema_version"], collect.SCHEMA_VERSION)
+        self.assertEqual(content["collector_version"],
+                         collect.COLLECTOR_VERSION)
+        self.assertEqual(content["sample_count"], 288)
+        self.assertEqual(content["coverage"], 1.0)
+        self.assertEqual(content["satellites"], [18])
+        self.assertEqual(content["sources"], ["primary"])
+        self.assertIn("samples_sha256", content)
+        # Cada franja es una muestra con los 13 canales, identificados por su
+        # nombre (`channel`), con el rango de energia y el yaw_flip intactos.
+        for sample in content["samples"]:
+            self.assertEqual(sorted(sample["flux"].keys()),
+                             sorted(DIFF_CHANNELS))
+            self.assertEqual(sorted(sample["energy"].keys()),
+                             sorted(DIFF_CHANNELS))
+            for channel in DIFF_CHANNELS:
+                self.assertEqual(sample["energy"][channel],
+                                 DIFF_ENERGIES[channel])
+                self.assertGreaterEqual(sample["flux"][channel], 0.0)
+            self.assertEqual(sample["sat"], 18)
+            self.assertEqual(sample["src"], "primary")
+            self.assertIn("yaw_flip", sample)
+        # El fichero INTEGRAL del mismo dia sigue existiendo y con su esquema
+        # (flux por rango de energia, sin canales P1..P10).
+        integral = read_json(day_path(self.root, "2026-09-05"))
+        self.assertTrue(integral["complete"])
+        self.assertEqual(integral["sample_count"], 288)
+        int_sample = integral["samples"][0]
+        self.assertIn(">=10 MeV", int_sample["flux"])
+        self.assertNotIn("P1", int_sample["flux"])
+        self.assertNotIn("yaw_flip", int_sample)
+        self.assertNotIn("energy", int_sample)
+
+    def test_sample_preserves_yaw_flip_and_energy(self):
+        feeds = dict(self.diff_feeds)
+        feeds[("7d", "primary")] = build_diff_feed(self.days, [18],
+                                                   flux=1.0, yaw_flip=1)
+        self._run(diff_feeds=feeds)
+        sample = self._diff_file("2026-09-03")["samples"][0]
+        self.assertEqual(sample["yaw_flip"], 1)
+        self.assertEqual(sample["t"], "2026-09-03T00:00:00Z")
+        for channel in DIFF_CHANNELS:
+            self.assertEqual(sample["energy"][channel],
+                             DIFF_ENERGIES[channel])
+
+
+class TestDiffCoverageRule(DiffCollectorTestCase):
+    """Regla de cierre identica a la del integral: >= 274/288 para COMPLETO."""
+
+    def _feeds_for(self, day, missing_slots, include_day=True):
+        days = list(self.days)
+        if not include_day:
+            days = [d for d in days if d != day]
+        holes = {(day, ts) for ts in day_slots(day)[:missing_slots]}
+        feeds = dict(self.diff_feeds)
+        feeds[("7d", "primary")] = build_diff_feed(days, [18], holes=holes)
+        return feeds
+
+    def test_day_with_274_of_288_closes_complete(self):
+        # 274/288 = 0.9514 >= 0.95: cierra como COMPLETO dentro de la ventana.
+        self._run(diff_feeds=self._feeds_for("2026-09-04", missing_slots=14))
+        content = self._diff_file("2026-09-04")
+        self.assertTrue(content["complete"])
+        self.assertEqual(content["sample_count"], 274)
+        self.assertEqual(content["coverage"], 0.9514)
+        self.assertEqual(len(content["samples"]), 274)
+        entries = self._diff_incomplete()
+        self.assertNotIn("2026-09-04", entries)
+
+    def test_day_with_273_of_288_not_complete_while_in_window(self):
+        # 273/288 = 0.9479 < 0.95: NO cierra mientras esta en la ventana.
+        self._run(diff_feeds=self._feeds_for("2026-09-04", missing_slots=15))
+        self.assertFalse(os.path.exists(self.diff_day_path("2026-09-04")),
+                         "273/288 no debe cerrar dentro de la ventana")
+        entries = self._diff_incomplete()
+        entry = entries.get("2026-09-04")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["missing_slots"], 15)
+        self.assertFalse(entry["permanent"])
+        # Lo acumulado se persiste EN DISCO (manifest.differential.pending_days).
+        diff = self._manifest()["differential"]
+        pending = (diff.get("pending_days") or {}).get("2026-09-04") or {}
+        samples = pending.get("samples") or {}
+        self.assertEqual(len(samples), 273)
+        # Mientras tanto el dominio integral, sano, SI cerro ese mismo dia:
+        # la cobertura de un dominio no bloquea ni pisa a la del otro.
+        integral = read_json(day_path(self.root, "2026-09-04"))
+        self.assertTrue(integral["complete"])
+        self.assertEqual(integral["sample_count"], 288)
+
+    def test_day_leaving_window_closes_with_accumulated_on_disk(self):
+        # Corrida 1: 09-04 diferencial queda provisional con 273/288.
+        feeds1 = self._feeds_for("2026-09-04", missing_slots=15)
+        self._run(diff_feeds=feeds1)
+        self.assertFalse(os.path.exists(self.diff_day_path("2026-09-04")))
+        # Corrida 2: fuera de la ventana y SWPC ya no sirve el 09-04: se
+        # cierra con lo acumulado en disco (273/288 reales), complete false.
+        feeds2 = self._feeds_for("2026-09-04", missing_slots=15,
+                                 include_day=False)
+        self._run(diff_feeds=feeds2, now="2026-09-12T00:30:00Z")
+        content = self._diff_file("2026-09-04")
+        self.assertFalse(content["complete"])
+        self.assertEqual(content["sample_count"], 273)
+        self.assertEqual(content["coverage"], 0.9479)
+        entry = self._diff_incomplete().get("2026-09-04")
+        self.assertIsNotNone(entry)
+        self.assertTrue(entry["permanent"])
+        self.assertEqual(entry["missing_slots"], 15)
+
+
+class TestDiffSentinelFlux(DiffCollectorTestCase):
+    """En el diferencial, un slot con flujo centinela cuenta como AUSENTE.
+
+    Si se archivara como flujo real, una lectura centinela (negativa) entraria
+    en la linea base y en la dosis. Un slot cuyo unico dato es centinela no
+    rellena la franja: ni como cero ni como medida.
+    """
+
+    SENTINEL_SLOTS = 20   # > 288-274: hunde el dia por debajo del umbral
+    DAY = "2026-09-05"
+
+    def _sentinel_feeds(self):
+        slots = day_slots(self.DAY)[:self.SENTINEL_SLOTS]
+        holes = {(self.DAY, ts) for ts in slots}
+        sentinel = []
+        for ts in slots:
+            sentinel.extend(diff_rows_for(ts, 18, -100000.0))
+        feeds = dict(self.diff_feeds)
+        feeds[("7d", "primary")] = build_diff_feed(self.days, [18], flux=1.0,
+                                                   holes=holes,
+                                                   extra=sentinel)
+        return feeds
+
+    def test_sentinel_slot_counts_as_absent_never_as_zero(self):
+        self._run(diff_feeds=self._sentinel_feeds())
+        self.assertFalse(
+            os.path.exists(self.diff_day_path(self.DAY)),
+            "268/288 esta bajo el umbral: el dia no puede cerrar todavia")
+        diff = self._manifest()["differential"]
+        entries = {e["day"]: e for e in diff["incomplete_days"]}
+        entry = entries.get(self.DAY)
+        self.assertIsNotNone(entry, "el dia incompleto queda registrado")
+        self.assertEqual(entry["missing_slots"], self.SENTINEL_SLOTS)
+        self.assertFalse(entry["permanent"])
+        # Los slots con solo centinela no aparecen: ni con el centinela ni
+        # inventados como cero.
+        pending = (diff.get("pending_days") or {}).get(self.DAY) or {}
+        samples = pending.get("samples") or {}
+        self.assertEqual(len(samples), 288 - self.SENTINEL_SLOTS)
+        for frame in samples.values():
+            for flux in frame["flux"].values():
+                self.assertGreaterEqual(
+                    flux, 0.0,
+                    "centinela archivado como flujo real")
+
+    def test_no_negative_flux_ever_reaches_the_archived_file(self):
+        self._run(diff_feeds=self._sentinel_feeds())
+        # Segunda corrida 8 dias despues: el dia sale de ventana y cierra
+        # como incompleto permanente con lo acumulado en disco.
+        later_days = ["2026-09-%02d" % d for d in range(8, 14)]
+        later_tail = slot_times("2026-09-13T18:30:00Z",
+                                "2026-09-14T00:25:00Z")
+        self._run(
+            feeds={
+                ("7d", "primary"): build_feed(later_days, [18], flux=1.0),
+                ("6h", "primary"): build_feed(
+                    [], [18], extra=[r for ts in later_tail
+                                     for r in _rows_for(ts, 18, 1.0)]),
+            },
+            diff_feeds={
+                ("7d", "primary"): build_diff_feed(later_days, [18],
+                                                   flux=1.0),
+                ("6h", "primary"): build_diff_feed(
+                    [], [18], extra=[r for ts in later_tail
+                                     for r in diff_rows_for(ts, 18, 1.0)]),
+            },
+            now="2026-09-14T00:30:00Z")
+        data = self._diff_file(self.DAY)
+        self.assertFalse(data["complete"])
+        self.assertEqual(data["sample_count"], 288 - self.SENTINEL_SLOTS)
+        self.assertEqual(data["coverage"], 0.9306)
+        for sample in data["samples"]:
+            for flux in sample["flux"].values():
+                self.assertGreaterEqual(
+                    flux, 0.0,
+                    "centinela archivado como flujo real")
+        entry = self._diff_incomplete().get(self.DAY)
+        self.assertIsNotNone(entry)
+        self.assertTrue(entry["permanent"])
+
+
+class TestDiffFilesSeparate(DiffCollectorTestCase):
+    """El fichero -diff.json no pisa al integral ni al reves."""
+
+    def test_diff_file_never_clobbers_integral_or_vice_versa(self):
+        self._run()
+        int_path = day_path(self.root, "2026-09-04")
+        diff_path = self.diff_day_path("2026-09-04")
+        self.assertTrue(os.path.exists(int_path))
+        self.assertTrue(os.path.exists(diff_path))
+        with open(int_path, "rb") as fh:
+            int_before = fh.read()
+        with open(diff_path, "rb") as fh:
+            diff_before = fh.read()
+
+        # Corrida posterior con datos distintos en AMBOS dominios: los dias ya
+        # cerrados son inmutables y cada dominio escribe solo su fichero.
+        self._run(
+            feeds={
+                ("7d", "primary"): build_feed(self.days, [18], flux=2.0),
+                ("6h", "primary"): build_feed(
+                    [], [18], extra=[r for ts in slot_times(
+                        "2026-09-05T18:30:00Z", "2026-09-06T00:25:00Z")
+                        for r in _rows_for(ts, 18, 2.0)]),
+            },
+            diff_feeds={
+                ("7d", "primary"): build_diff_feed(self.days, [18], flux=2.0),
+                ("6h", "primary"): build_diff_feed(
+                    [], [18], extra=[r for ts in slot_times(
+                        "2026-09-05T18:30:00Z", "2026-09-06T00:25:00Z")
+                        for r in diff_rows_for(ts, 18, 2.0)]),
+            },
+            now="2026-09-06T06:30:00Z")
+
+        with open(int_path, "rb") as fh:
+            int_after = fh.read()
+        with open(diff_path, "rb") as fh:
+            diff_after = fh.read()
+        self.assertEqual(int_before, int_after,
+                         "el fichero integral fue reescrito")
+        self.assertEqual(diff_before, diff_after,
+                         "el fichero -diff.json fue reescrito")
+        # Y cada fichero conserva el contenido de SU dominio.
+        int_obj = read_json(int_path)
+        diff_obj = read_json(diff_path)
+        self.assertIn(">=10 MeV", int_obj["samples"][0]["flux"])
+        self.assertIn("P1", diff_obj["samples"][0]["flux"])
+        self.assertNotEqual(int_obj["samples_sha256"],
+                            diff_obj["samples_sha256"])
+
+
+class TestDiffFallbackSecondary(DiffCollectorTestCase):
+    """Si el feed diferencial primario falla, se usa el secondary."""
+
+    def test_diff_secondary_used_when_diff_primary_down(self):
+        diff_feeds = {
+            ("7d", "primary"): None,
+            ("6h", "primary"): None,
+            ("7d", "secondary"): build_diff_feed(self.days, [19], flux=1.0),
+            ("6h", "secondary"): build_diff_feed(
+                [], [19], extra=[r for ts in slot_times(
+                    "2026-09-05T18:30:00Z", "2026-09-06T00:25:00Z")
+                    for r in diff_rows_for(ts, 19, 1.0)]),
+        }
+        self._run(diff_feeds=diff_feeds)
+        # Los dias se cierran con los datos del satelite secundario.
+        content = self._diff_file("2026-09-01")
+        self.assertEqual(content["satellites"], [19])
+        self.assertEqual(content["sources"], ["secondary"])
+        for sample in content["samples"]:
+            self.assertEqual(sample["sat"], 19)
+            self.assertEqual(sample["src"], "secondary")
+        manifest = self._manifest()
+        # El fallo del diferencial se registra en SU seccion, no en la raiz.
+        self.assertIsNotNone(manifest["last_error"])
+        diff = manifest["differential"]
+        self.assertIsNotNone(diff["last_error"])
+        self.assertIn("7d/diff-primary", diff["last_error"])
+        self.assertEqual(diff["satellites"],
+                         {"primary": None, "secondary": 19})
+        # El integral estaba sano y sigue archivandose.
+        self.assertEqual(manifest["coverage"]["days_complete"], 7)
+
+
+class TestDiffManifestCoverage(DiffCollectorTestCase):
+    """El manifest distingue la cobertura integral de la diferencial."""
+
+    def test_manifest_distinguishes_integral_and_differential_coverage(self):
+        # El diferencial tiene un hueco el 09-04 (15 slots); el integral no.
+        feeds = dict(self.diff_feeds)
+        holes = {("2026-09-04", ts) for ts in day_slots("2026-09-04")[:15]}
+        feeds[("7d", "primary")] = build_diff_feed(self.days, [18],
+                                                   holes=holes)
+        self._run(diff_feeds=feeds)
+        manifest = self._manifest()
+
+        # Integral (claves de siempre, sin romper): los 7 dias completos.
+        cov = manifest["coverage"]
+        self.assertEqual(cov["days_complete"], 7)
+        self.assertEqual(cov["days_incomplete"], 0)
+        self.assertEqual(len(cov["days"]), 7)
+        self.assertEqual(manifest["incomplete_days"], [])
+
+        # Diferencial: seccion paralela con su propia cobertura.
+        diff = manifest["differential"]
+        dcov = diff["coverage"]
+        self.assertEqual(dcov["days_complete"], 6)
+        self.assertEqual(dcov["days_incomplete"], 1)
+        self.assertEqual(dcov["first_day"], "2026-08-30")
+        self.assertEqual(dcov["last_day"], "2026-09-05")
+        self.assertIn("2026-09-04", cov["days"])       # integral: cerrado
+        self.assertNotIn("2026-09-04", dcov["days"])   # diferencial: hueco
+        entries = {e["day"]: e for e in diff["incomplete_days"]}
+        self.assertEqual(entries["2026-09-04"]["missing_slots"], 15)
+
+
+class TestDiffDownNotFatal(DiffCollectorTestCase):
+    """Un fallo del diferencial NO es fatal: el integral sigue archivandose.
+
+    El integral alimenta el semaforo y debe seguir cerrándose aunque el feed
+    diferencial este caido; el fallo queda registrado en
+    manifest["differential"]["last_error"] y se reintenta en la siguiente
+    corrida dentro de la ventana SWPC de 7 dias.
+    """
+
+    def test_diff_down_records_error_but_integral_still_archives(self):
+        # Integral SANO (primario + secundario disponibles) y diferencial
+        # totalmente caido: ninguna URL diferencial es conocida.
+        feeds = dict(self.feeds)
+        feeds[("7d", "secondary")] = build_feed(self.days, [18], flux=1.0)
+        feeds[("6h", "secondary")] = build_feed(
+            [], [18], extra=[r for ts in slot_times(
+                "2026-09-05T18:30:00Z", "2026-09-06T00:25:00Z")
+                for r in _rows_for(ts, 18, 1.0)])
+        fetcher = Fetcher(feeds)
+        rc = run_once(self.root, fetcher, self.now)
+        self.assertEqual(rc, 0, "el diferencial caido no puede tumbar la "
+                         "corrida mientras el integral este sano")
+        # El integral sigue archivandose (alimenta el semaforo).
+        content = read_json(day_path(self.root, "2026-09-05"))
+        self.assertTrue(content["complete"])
+        self.assertEqual(content["sample_count"], 288)
+        self.assertFalse(os.path.exists(self.diff_day_path("2026-09-05")),
+                         "sin datos diferenciales no se escribe ningun "
+                         "fichero -diff.json")
+        manifest = self._manifest()
+        self.assertIsNone(manifest["last_error"],
+                          "el integral estaba sano: sin error en la raiz")
+        diff = manifest["differential"]
+        self.assertIsNotNone(diff["last_error"],
+                             "el fallo del diferencial debe quedar "
+                             "registrado en su seccion")
+        self.assertIn("sin datos de ningun feed (differential)",
+                      diff["last_error"])
+        self.assertEqual(manifest["coverage"]["days_complete"], 7)
+
+
+class TestDiffPartialChannels(DiffCollectorTestCase):
+    """Un slot al que le faltan canales NO es una muestra utilizable.
+
+    El ajuste espectral se hace sobre los 13 canales; un slot con dos de
+    ellos no es "casi completo", es inservible. Archivarlo como muestra
+    valida meteria un espectro truncado en el ajuste sin que nada avise.
+    """
+
+    PARTIAL_SLOTS = 20        # > 288-274: hunde el dia bajo el umbral
+    # Dia del INTERIOR de la ventana: cierra solo con el feed de 7 d, sin
+    # depender del de 6 h. Usar el dia en curso enmascara la mutacion.
+    DAY = "2026-09-02"
+
+    def _partial_feed(self, keep):
+        """Feed con PARTIAL_SLOTS slots reducidos a los canales de `keep`."""
+        slots = day_slots(self.DAY)[:self.PARTIAL_SLOTS]
+        holes = {(self.DAY, ts) for ts in slots}
+        partial = []
+        for ts in slots:
+            for row in diff_rows_for(ts, 18, 1.0):
+                if row["channel"] in keep:
+                    partial.append(row)
+        return build_diff_feed(self.days, [18], flux=1.0,
+                               holes=holes, extra=partial)
+
+    def test_slot_con_un_solo_canal_cuenta_como_ausente(self):
+        feeds = dict(self.diff_feeds)
+        feeds[("7d", "primary")] = self._partial_feed({"P1"})
+        self._run(diff_feeds=feeds)
+        self.assertFalse(
+            os.path.exists(self.diff_day_path(self.DAY)),
+            "268/288 slots utilizables: el dia no puede cerrar todavia")
+
+    def test_slot_al_que_le_falta_un_solo_canal_cuenta_como_ausente(self):
+        keep = set(DIFF_CHANNELS) - {"P10"}
+        feeds = dict(self.diff_feeds)
+        feeds[("7d", "primary")] = self._partial_feed(keep)
+        self._run(diff_feeds=feeds)
+        self.assertFalse(
+            os.path.exists(self.diff_day_path(self.DAY)),
+            "faltando P10 (el canal mas duro) el slot no es utilizable")
+
+    def test_todos_los_slots_archivados_traen_los_13_canales(self):
+        self._run()
+        data = self._diff_file("2026-09-04")
+        self.assertTrue(data["complete"])
+        for sample in data["samples"]:
+            self.assertEqual(
+                sorted(sample["flux"]), sorted(DIFF_CHANNELS),
+                "muestra archivada sin los 13 canales")
