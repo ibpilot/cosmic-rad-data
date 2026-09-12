@@ -11,12 +11,13 @@
       "2026-09-06",
       "2026-09-07",
       "2026-09-08",
-      "2026-09-09"
+      "2026-09-09",
+      "2026-09-11"
     ],
-    "days_complete": 10,
+    "days_complete": 11,
     "days_incomplete": 3,
     "first_day": "2026-08-30",
-    "last_day": "2026-09-09"
+    "last_day": "2026-09-11"
   },
   "differential": {
     "collector_version": "1.1.0",
@@ -31,12 +32,13 @@
         "2026-09-06",
         "2026-09-07",
         "2026-09-08",
-        "2026-09-09"
+        "2026-09-09",
+        "2026-09-11"
       ],
-      "days_complete": 10,
+      "days_complete": 11,
       "days_incomplete": 3,
       "first_day": "2026-08-30",
-      "last_day": "2026-09-09"
+      "last_day": "2026-09-11"
     },
     "incomplete_days": [
       {
@@ -55,7 +57,7 @@
         "satellites_seen": [
           18
         ],
-        "updated_at": "2026-09-11T20:46:08Z"
+        "updated_at": "2026-09-12T04:01:35Z"
       },
       {
         "day": "2026-09-10",
@@ -64,11 +66,11 @@
         "satellites_seen": [
           18
         ],
-        "updated_at": "2026-09-11T20:46:08Z"
+        "updated_at": "2026-09-12T04:01:35Z"
       }
     ],
     "last_error": null,
-    "last_success": "2026-09-11T20:46:08Z",
+    "last_success": "2026-09-12T04:01:35Z",
     "pending_days": {
       "2026-09-05": {
         "samples": {
@@ -19456,7 +19458,7 @@
       19
     ],
     "schema_version": 1,
-    "updated_at": "2026-09-11T20:46:08Z",
+    "updated_at": "2026-09-12T04:01:35Z",
     "version": "1.1.0"
   },
   "incomplete_days": [
@@ -19476,7 +19478,7 @@
       "satellites_seen": [
         18
       ],
-      "updated_at": "2026-09-11T20:46:08Z"
+      "updated_at": "2026-09-12T04:01:35Z"
     },
     {
       "day": "2026-09-10",
@@ -19485,11 +19487,11 @@
       "satellites_seen": [
         18
       ],
-      "updated_at": "2026-09-11T20:46:08Z"
+      "updated_at": "2026-09-12T04:01:35Z"
     }
   ],
   "last_error": null,
-  "last_success": "2026-09-11T20:46:08Z",
+  "last_success": "2026-09-12T04:01:35Z",
   "pending_days": {
     "2026-09-05": {
       "samples": {
@@ -27579,6 +27581,6 @@
     19
   ],
   "schema_version": 1,
-  "updated_at": "2026-09-11T20:46:08Z",
+  "updated_at": "2026-09-12T04:01:35Z",
   "version": "1.1.0"
 }
