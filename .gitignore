@@ -1,0 +1,7 @@
+CONTEXTO*.md
+memoria
+graphify-out/
+
+.DS_Store
+__pycache__/
+SPEC_FLASH*.md
