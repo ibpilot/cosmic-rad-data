@@ -54,6 +54,17 @@ HARD_CHANNELS = ('P8A', 'P8B', 'P8C', 'P9', 'P10')
 DEFAULT_SATELLITES = ("g18", "g19")
 RETRY_ATTEMPTS = 3
 RETRY_DELAY_S = 1.0
+# El catch-up automatico pide hasta el ultimo dia que NCEI ya deberia haber
+# publicado. La latencia medida es ~2 dias (2026-09-13: NCEI publicaba G18/G19
+# hasta el 09-11). Pedir "hoy" seria pedir un dia inexistente y dejaria un hueco
+# en el manifiesto; el dia que aun no esta se reintenta en la pasada siguiente.
+NCEI_LATENCY_DAYS = 2
+# Tope de dias por pasada. El workflow corre cada 6 h, asi que en regimen normal
+# son 0-1 dias; el tope solo acota una primera pasada o una caida larga de NCEI.
+# Con backlog mayor que el tope se recorta `end` (no se mueve `start`): la pasada
+# cubre el primer bloque cronologico y la siguiente continua en el dia inmediato
+# posterior, sin saltar dias (idempotente y resumible).
+CATCHUP_MAX_DAYS = 30
 
 TIME_VARS = ("time", "L2_SciData_TimeStamp")
 YAW_VARS = ("yaw_flip_flag", "YawFlipFlag")
@@ -764,6 +775,125 @@ def build_manifest(root, existing, generated_at):
 # Orquestación
 # ---------------------------------------------------------------------------
 
+def _now_date(now):
+    """Fecha UTC de `now` (None = ahora), reutilizando el parser de `_fmt_now`."""
+    return datetime.datetime.strptime(_fmt_now(now), "%Y-%m-%dT%H:%M:%SZ").date()
+
+
+def _valid_day(value):
+    """`value` como dia ISO (YYYY-MM-DD) valido, o None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        datetime.date.fromisoformat(value)
+    except ValueError:
+        return None
+    return value
+
+
+def _entry_satellites(entry):
+    """Satelites con artefacto/candidato en una entrada de dia del manifiesto."""
+    if not isinstance(entry, dict):
+        return set()
+    candidates = entry.get("candidates")
+    sats = set()
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            if (isinstance(candidate, dict)
+                    and isinstance(candidate.get("sat"), str)):
+                sats.add(candidate["sat"])
+    return sats
+
+
+def presence_by_day(data_root, manifest=None):
+    """{dia: set(satelites con artefacto/candidato)} de la evidencia disponible.
+
+    Prefiere el manifiesto (barato y ya lista los candidatos por dia); si `days`
+    no tiene entradas validas, deriva la presencia escaneando el arbol. Un dia
+    ausente del mapa carece de artefacto para cualquier satelite.
+    """
+    if manifest is None:
+        manifest = read_json(
+            os.path.join(data_root, NCEI_ROOT, "manifest.json"), None)
+    days = manifest.get("days") if isinstance(manifest, dict) else None
+    if isinstance(days, dict):
+        out = {}
+        for day, entry in days.items():
+            day = _valid_day(day)
+            if day is not None:
+                out[day] = _entry_satellites(entry)
+        if out:
+            return out
+    out = {}
+    for day, sat, _path, _rel, _obj in scan_artifacts(data_root):
+        day = _valid_day(day)
+        if day is not None and isinstance(sat, str):
+            out.setdefault(day, set()).add(sat)
+    return out
+
+
+def _first_incomplete_day(presence, first, last, required):
+    """Primer dia de [first, last] sin TODOS los satelites requeridos, o None."""
+    day = first
+    while day <= last:
+        if not required <= presence.get(day.isoformat(), set()):
+            return day
+        day += datetime.timedelta(days=1)
+    return None
+
+
+def catchup_range(data_root, now, satellites=None,
+                  latency_days=NCEI_LATENCY_DAYS, max_days=CATCHUP_MAX_DAYS):
+    """Rango inclusivo (start_day, end_day) del catch-up, o None si ya al dia.
+
+    `target_end` = hoy UTC - latencia: el ultimo dia razonablemente publicado por
+    NCEI. `satellites` son los requeridos (por defecto, los del CLI). `start_day`
+    es el PRIMER dia del historico con evidencia que no tiene artefacto/candidato
+    para TODOS los requeridos: un ultimo dia con solo g18 (falta g19) se
+    reintenta ese mismo dia, y un hueco intermedio no se salta aunque haya dias
+    posteriores completos. Si no falta ningun dia, `start_day` = ultimo presente
+    + 1. Sin manifiesto usable la presencia se deriva del arbol; sin evidencia
+    real se cae al recurso legacy `range.to` o, en su defecto, a `max_days` hacia
+    atras desde `target_end` para no intentar la historia entera de golpe. El
+    tope se aplica SIEMPRE recortando `end_day` = min(target_end, start_day +
+    max_days - 1), nunca moviendo `start_day`: con un backlog mayor que `max_days`
+    la pasada devuelve el primer bloque cronologico y la siguiente continua en el
+    dia inmediatamente posterior, sin saltar dias.
+    """
+    if latency_days < 0:
+        raise ValueError("latency_days < 0")
+    if max_days < 1:
+        raise ValueError("max_days < 1")
+    required = set(satellites) if satellites else set(DEFAULT_SATELLITES)
+    target_end = _now_date(now) - datetime.timedelta(days=latency_days)
+    manifest = read_json(
+        os.path.join(data_root, NCEI_ROOT, "manifest.json"), None)
+    presence = presence_by_day(data_root, manifest)
+    if presence:
+        # El historico empieza en el primer dia con evidencia: en un manifiesto
+        # sano coincide con su `range.from`.
+        first = min(presence)
+        last = max(presence)
+        start = _first_incomplete_day(
+            presence, datetime.date.fromisoformat(first),
+            datetime.date.fromisoformat(last), required)
+        if start is None:
+            start = (datetime.date.fromisoformat(last)
+                     + datetime.timedelta(days=1))
+    else:
+        rng = manifest.get("range") if isinstance(manifest, dict) else None
+        legacy_last = _valid_day(rng.get("to")) if isinstance(rng, dict) else None
+        if legacy_last is not None:
+            start = (datetime.date.fromisoformat(legacy_last)
+                     + datetime.timedelta(days=1))
+        else:
+            start = target_end - datetime.timedelta(days=max_days - 1)
+    if start > target_end:
+        return None
+    end = min(target_end, start + datetime.timedelta(days=max_days - 1))
+    return start.isoformat(), end.isoformat()
+
+
 def import_range(data_root, start_day, end_day, satellites, fetch,
                  now, read=None, sleep=None, dry_run=False, resume=False):
     """Importa el rango inclusivo. Fallos por satélite se registran y se sigue."""
@@ -870,7 +1000,17 @@ def import_range(data_root, start_day, end_day, satellites, fetch,
         previous = read_json(
             os.path.join(data_root, NCEI_ROOT, "manifest.json"), None)
         base = dict(previous) if isinstance(previous, dict) else {}
-        base["range"] = {"from": start_day, "to": end_day}
+        # El rango publicado es MONOTONO: una pasada incremental no puede
+        # encogerlo (perderia `missing_days` y la ventana que lee la app). Se
+        # conserva el minimo `from` y el maximo `to` ya vistos.
+        first, last = start_day, end_day
+        rng = previous.get("range") if isinstance(previous, dict) else None
+        if isinstance(rng, dict):
+            if isinstance(rng.get("from"), str) and rng["from"] < first:
+                first = rng["from"]
+            if isinstance(rng.get("to"), str) and rng["to"] > last:
+                last = rng["to"]
+        base["range"] = {"from": first, "to": last}
         manifest = build_manifest(data_root, base, generated_at)
         for day in days:
             entry = manifest.get("days", {}).get(day)
@@ -903,7 +1043,7 @@ def _print_report(report, args, satellites):
     print("satélites: %s" % ",".join(satellites))
     if args.dry_run:
         print("modo: dry-run (sin escrituras)")
-    if args.resume:
+    if args.resume or getattr(args, "catch_up", False):
         print("modo: resume")
     for sat, day, reason in report.errors:
         print("error: %s %s: %s" % (sat, day, reason), file=sys.stderr)
@@ -912,8 +1052,18 @@ def _print_report(report, args, satellites):
 def main(argv, fetch=None, read=None, now=None):
     parser = argparse.ArgumentParser(prog="backfill_ncei.py")
     parser.add_argument("data_root")
-    parser.add_argument("--from", dest="start_day", required=True)
-    parser.add_argument("--to", dest="end_day", required=True)
+    parser.add_argument("--from", dest="start_day")
+    parser.add_argument("--to", dest="end_day")
+    parser.add_argument("--catch-up", action="store_true",
+                        help="rango automatico: desde el primer dia incompleto "
+                             "(sin todos los satelites requeridos, o el "
+                             "siguiente al ultimo importado si no hay huecos) "
+                             "hasta el ultimo publicado por NCEI, recortado a "
+                             "--max-days sin saltar dias")
+    parser.add_argument("--latency-days", type=int, default=NCEI_LATENCY_DAYS)
+    parser.add_argument("--max-days", type=int, default=CATCHUP_MAX_DAYS,
+                        help="tope de dias por pasada; con backlog mayor se "
+                             "recorta el final y la siguiente pasada continua")
     parser.add_argument("--satellites", default=",".join(DEFAULT_SATELLITES))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--resume", action="store_true")
@@ -925,11 +1075,32 @@ def main(argv, fetch=None, read=None, now=None):
     if not satellites or any(s not in NCEI_DIR for s in satellites):
         print("satélites inválidos: %s" % args.satellites, file=sys.stderr)
         return 1
+    if args.catch_up:
+        try:
+            rng = catchup_range(args.data_root, now, satellites,
+                                latency_days=args.latency_days,
+                                max_days=args.max_days)
+        except ValueError as exc:
+            print("argumentos inválidos: %s" % exc, file=sys.stderr)
+            return 1
+        if rng is None:
+            last_pub = _now_date(now) - datetime.timedelta(
+                days=args.latency_days)
+            print("catch-up: sin días nuevos (NCEI con latencia %d días "
+                  "publica hasta el %s)" % (args.latency_days, last_pub))
+            return 0
+        args.start_day, args.end_day = rng
+        print("catch-up: %s -> %s" % (args.start_day, args.end_day))
+    if not args.start_day or not args.end_day:
+        print("faltan --from/--to (o usa --catch-up)", file=sys.stderr)
+        return 1
+    # En catch-up se reanuda siempre: los dias ya presentes no se reescriben.
+    resume = args.resume or args.catch_up
     try:
         report = import_range(
             args.data_root, args.start_day, args.end_day, satellites,
             fetch or http_get, now, read=read,
-            dry_run=args.dry_run, resume=args.resume)
+            dry_run=args.dry_run, resume=resume)
     except ValueError as exc:
         print("argumentos inválidos: %s" % exc, file=sys.stderr)
         return 1

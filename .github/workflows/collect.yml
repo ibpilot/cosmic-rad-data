@@ -33,6 +33,18 @@ jobs:
       - name: Run collector
         run: python3 collect.py .
 
+      - name: NCEI catch-up (incremental y acotado)
+        # Extiende ncei/ desde el dia siguiente al ultimo importado hasta el
+        # ultimo que NCEI ya deberia haber publicado (hoy - latencia). Es
+        # idempotente y reanudable: los dias ya presentes no se reescriben, y un
+        # dia que aun no este se reintenta en la pasada siguiente. No bloquea el
+        # archivo SWPC (la ventana irreversible): si NCEI falla, el paso queda en
+        # rojo pero el commit de abajo publica igual lo recogido.
+        continue-on-error: true
+        run: |
+          python3 -m pip install --quiet h5py
+          python3 backfill_ncei.py . --catch-up --satellites g18,g19
+
       - name: Commit and push
         run: |
           git config user.name "cosmic-rad-data bot"
@@ -41,8 +53,8 @@ jobs:
           # 'git add solar' con pathspec inexistente aborta el job.
           git add -A
           if git diff --cached --quiet; then
-            echo "Sin cambios en solar/ ni manifest.json; no hay commit."
+            echo "Sin cambios en solar/ ni ncei/; no hay commit."
           else
-            git commit -m "colector: actualizar archivo solar y manifest"
+            git commit -m "colector: actualizar archivo solar y NCEI"
             git push
           fi

@@ -12,11 +12,13 @@ import contextlib
 import datetime
 import hashlib
 import io
+import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import backfill_ncei as bf
 
@@ -538,6 +540,254 @@ class BackfillTest(unittest.TestCase):
         manifest = bf.build_manifest(
             root, {"range": {"from": DAY, "to": DAY}}, T0)
         self.assertEqual(manifest["days"][DAY]["status"], "partial")
+
+
+    # -- T22 ----------------------------------------------------------------
+    def test_t22_catchup_range_sin_artefactos(self):
+        root = tempfile.mkdtemp()
+        # Sin nada importado: se acota `max_days` hacia atras desde el ultimo
+        # dia publicado (hoy - latencia).
+        rng = bf.catchup_range(root, "2026-09-13T00:00:00Z", max_days=5)
+        self.assertEqual(rng, ("2026-09-07", "2026-09-11"))
+
+    # -- T23 ----------------------------------------------------------------
+    def test_t23_catchup_range_desde_el_ultimo_presente(self):
+        root = tempfile.mkdtemp()
+        write_day(root, day="2026-09-05")
+        # El unico satelite requerido ya esta: no hay hueco y el cursor avanza.
+        rng = bf.catchup_range(root, "2026-09-13T00:00:00Z",
+                               satellites=["g18"])
+        self.assertEqual(rng, ("2026-09-06", "2026-09-11"))
+
+    # -- T24 ----------------------------------------------------------------
+    def test_t24_catchup_range_ya_al_dia(self):
+        root = tempfile.mkdtemp()
+        write_day(root, day="2026-09-11")
+        self.assertIsNone(bf.catchup_range(root, "2026-09-13T00:00:00Z",
+                                           satellites=["g18"]))
+
+    # -- T25 ----------------------------------------------------------------
+    def test_t25_catchup_range_acotado(self):
+        root = tempfile.mkdtemp()
+        write_day(root, day="2026-08-01")
+        # Con un hueco mayor que el tope NO se salta al final: se recorta el
+        # extremo `end` para devolver el primer bloque cronologico (5 dias desde
+        # el dia siguiente al ultimo presente). La pasada siguiente continua
+        # desde 2026-08-07, sin saltarse ningun dia.
+        rng = bf.catchup_range(root, "2026-09-13T00:00:00Z",
+                               satellites=["g18"], max_days=5)
+        self.assertEqual(rng, ("2026-08-02", "2026-08-06"))
+
+    # -- T26 ----------------------------------------------------------------
+    def test_t26_catchup_usa_range_to_como_legado_sin_evidencia(self):
+        root = tempfile.mkdtemp()
+        path = os.path.join(root, "ncei", "manifest.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"days": {}, "range": {"from": "2025-09-11",
+                                             "to": "2026-08-30"}}, fh)
+        # Sin `days` ni artefactos, el recurso legacy es `range.to`: el cursor
+        # arranca en el dia inmediatamente posterior.
+        self.assertEqual(bf.presence_by_day(root), {})
+        rng = bf.catchup_range(root, "2026-09-13T00:00:00Z")
+        self.assertEqual(rng, ("2026-08-31", "2026-09-11"))
+
+    # -- T26b ---------------------------------------------------------------
+    def test_t26b_presencia_de_artefacto_vence_a_range_futuro(self):
+        root = tempfile.mkdtemp()
+        write_day(root, day="2026-08-20")
+        path = os.path.join(root, "ncei", "manifest.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"days": {}, "range": {"from": "2025-09-11",
+                                             "to": "2026-08-30"}}, fh)
+        # `range.to` apunta a un dia futuro sin artefacto: la evidencia del arbol
+        # manda y el cursor se queda en el dia realmente presente.
+        self.assertEqual(max(bf.presence_by_day(root)), "2026-08-20")
+        self.assertEqual(bf.catchup_range(root, "2026-09-13T00:00:00Z")[0],
+                         "2026-08-20")
+
+    # -- T27 ----------------------------------------------------------------
+    def test_t27_main_catchup_extremo_a_extremo(self):
+        root = tempfile.mkdtemp()
+        name = "sci_sgps-l2-avg5m_g18_d20260911_v3-0-3.nc"
+        listings = {"g18": '<a href="%s">x</a>' % name}
+        fetch = _make_fetch(listings, b"NC-BYTES")
+        read = lambda _path: make_raw(day="2026-09-11", sat="g18")
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            code = bf.main([root, "--catch-up", "--satellites", "g18",
+                            "--max-days", "1"],
+                           fetch=fetch, read=read, now="2026-09-13T00:00:00Z")
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.exists(
+            bf.artifact_path(root, "g18", "2026-09-11", "v3-0-3")))
+        manifest = bf.read_json(os.path.join(root, "ncei", "manifest.json"))
+        self.assertIn("2026-09-11", manifest["days"])
+        self.assertEqual(manifest["range"], {"from": "2026-09-11",
+                                             "to": "2026-09-11"})
+
+    # -- T28 ----------------------------------------------------------------
+    def test_t28_catchup_sin_dias_nuevos_no_escribe(self):
+        root = tempfile.mkdtemp()
+        write_day(root, day="2026-09-11")
+        before = snapshot(root)
+        fetch = _make_fetch({}, b"NC-BYTES")
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            code = bf.main([root, "--catch-up", "--satellites", "g18"],
+                           fetch=fetch, read=lambda _p: make_raw(),
+                           now="2026-09-13T00:00:00Z")
+        self.assertEqual(code, 0)
+        self.assertEqual(snapshot(root), before)
+
+    # -- T29 ----------------------------------------------------------------
+    def test_t29_catchup_no_reescribe_historico(self):
+        root = tempfile.mkdtemp()
+        _hist, hist_path = write_day(root, day="2026-09-10")
+        hist_sha = hashlib.sha256(_read(hist_path)).hexdigest()
+        # Manifiesto ya publicado, como el del repo real.
+        mpath = os.path.join(root, "ncei", "manifest.json")
+        os.makedirs(os.path.dirname(mpath), exist_ok=True)
+        with open(mpath, "w", encoding="utf-8") as fh:
+            json.dump({"days": {"2026-09-10": {}},
+                       "range": {"from": "2025-09-11",
+                                 "to": "2026-09-10"}}, fh)
+        name = "sci_sgps-l2-avg5m_g18_d20260911_v3-0-3.nc"
+        fetch = _make_fetch({"g18": '<a href="%s">x</a>' % name}, b"NC-BYTES")
+        read = lambda _path: make_raw(day="2026-09-11", sat="g18")
+
+        def run_once():
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                return bf.main([root, "--catch-up", "--satellites", "g18"],
+                               fetch=fetch, read=read,
+                               now="2026-09-13T00:00:00Z")
+
+        self.assertEqual(run_once(), 0)
+        after_first = snapshot(root)
+        # El artefacto historico no se toca ni un byte.
+        self.assertEqual(hashlib.sha256(_read(hist_path)).hexdigest(), hist_sha)
+        # Segunda pasada con los mismos datos: idempotente, ni un byte cambia.
+        self.assertEqual(run_once(), 0)
+        self.assertEqual(snapshot(root), after_first)
+        # Y el rango publicado avanza, pero conserva su extremo historico.
+        manifest = bf.read_json(mpath)
+        self.assertEqual(manifest["range"], {"from": "2025-09-11",
+                                             "to": "2026-09-11"})
+
+    # -- T30 ----------------------------------------------------------------
+    def test_t30_rango_monotono_no_encoge(self):
+        root = tempfile.mkdtemp()
+        path = os.path.join(root, "ncei", "manifest.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"days": {}, "range": {"from": "2025-09-11",
+                                             "to": "2026-09-10"}}, fh)
+        name = "sci_sgps-l2-avg5m_g18_d20260911_v3-0-3.nc"
+        fetch = _make_fetch({"g18": '<a href="%s">x</a>' % name}, b"NC-BYTES")
+        bf.import_range(root, "2026-09-11", "2026-09-11", ["g18"], fetch,
+                        "2026-09-13T00:00:00Z",
+                        read=lambda _p: make_raw(day="2026-09-11", sat="g18"),
+                        sleep=lambda _s: None, resume=True)
+        manifest = bf.read_json(path)
+        self.assertEqual(manifest["range"]["from"], "2025-09-11")
+        self.assertEqual(manifest["range"]["to"], "2026-09-11")
+
+    # -- T31 ----------------------------------------------------------------
+    def test_t31_main_sin_rango_ni_catchup(self):
+        root = tempfile.mkdtemp()
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            code = bf.main([root, "--satellites", "g18"],
+                           fetch=_make_fetch({}, b""), read=lambda _p: None,
+                           now="2026-09-13T00:00:00Z")
+        self.assertEqual(code, 1)
+
+    # -- T32 ----------------------------------------------------------------
+    def test_t32_catchup_backlog_no_salta_dias(self):
+        root = tempfile.mkdtemp()
+        # Ultimo presente muy antiguo y tope pequeno: el primer bloque debe ser
+        # estrictamente el primero cronologico (dia siguiente al ultimo presente)
+        # y no el tramo final pegado a `end`.
+        write_day(root, day="2025-01-01")
+        first = bf.catchup_range(root, "2026-09-13T00:00:00Z",
+                                 satellites=["g18"], max_days=3)
+        self.assertEqual(first, ("2025-01-02", "2025-01-04"))
+
+        # Continuidad: simulamos que ese primer bloque ya se importo y la pasada
+        # siguiente debe empezar justo en el dia inmediatamente posterior.
+        for day in ("2025-01-02", "2025-01-03", "2025-01-04"):
+            write_day(root, day=day)
+        second = bf.catchup_range(root, "2026-09-13T00:00:00Z",
+                                  satellites=["g18"], max_days=3)
+        self.assertEqual(second, ("2025-01-05", "2025-01-07"))
+
+    # -- T33: (a) ultimo dia con un satelite faltante -------------------
+    def test_t33_catchup_reintenta_ultimo_dia_con_satelite_faltante(self):
+        root = tempfile.mkdtemp()
+        write_day(root, day="2026-09-09", sat="g18")
+        write_day(root, day="2026-09-09", sat="g19")
+        write_day(root, day="2026-09-10", sat="g18")   # ultimo dia: falta g19
+        # El cursor NO salta al dia posterior: empieza en el mismo dia incompleto.
+        self.assertEqual(bf.catchup_range(root, "2026-09-13T00:00:00Z"),
+                         ("2026-09-10", "2026-09-11"))
+        # Al añadir g19 el dia queda completo y el cursor avanza.
+        write_day(root, day="2026-09-10", sat="g19")
+        self.assertEqual(bf.catchup_range(root, "2026-09-13T00:00:00Z"),
+                         ("2026-09-11", "2026-09-11"))
+
+    # -- T34: (b) hueco intermedio no se salta --------------------------
+    def test_t34_catchup_no_salta_hueco_intermedio(self):
+        root = tempfile.mkdtemp()
+        write_day(root, day="2026-09-08", sat="g18")
+        write_day(root, day="2026-09-08", sat="g19")
+        write_day(root, day="2026-09-09", sat="g18")   # hueco: falta g19
+        write_day(root, day="2026-09-10", sat="g18")   # dia posterior completo
+        write_day(root, day="2026-09-10", sat="g19")
+        # Aunque 09-10 este completo, se vuelve al primer dia incompleto (09-09).
+        self.assertEqual(bf.catchup_range(root, "2026-09-13T00:00:00Z"),
+                         ("2026-09-09", "2026-09-11"))
+
+    # -- T35: (c) el requisito decide que es un dia completo -------------
+    def test_t35_catchup_requisito_parcial_considera_completo(self):
+        root = tempfile.mkdtemp()
+        write_day(root, day="2026-09-10", sat="g18")
+        # Pidiendo solo g18, el dia esta completo y el cursor avanza.
+        self.assertEqual(
+            bf.catchup_range(root, "2026-09-13T00:00:00Z", satellites=["g18"]),
+            ("2026-09-11", "2026-09-11"))
+        # Pidiendo g18 y g19, el mismo dia se reintenta.
+        self.assertEqual(
+            bf.catchup_range(root, "2026-09-13T00:00:00Z",
+                             satellites=["g18", "g19"]),
+            ("2026-09-10", "2026-09-11"))
+
+    # -- T36: (d) main --catch-up propaga los satelites parseados --------
+    def test_t36_main_catchup_pasa_satelites_al_cursor(self):
+        root = tempfile.mkdtemp()
+        seen = {}
+
+        def fake_catchup(data_root, now, satellites=None, latency_days=None,
+                         max_days=None):
+            seen["data_root"] = data_root
+            seen["satellites"] = list(satellites) if satellites else None
+            seen["latency_days"] = latency_days
+            seen["max_days"] = max_days
+            return None
+
+        with mock.patch.object(bf, "catchup_range", fake_catchup):
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                code = bf.main([root, "--catch-up", "--satellites", "g18,g19",
+                                "--latency-days", "3", "--max-days", "7"],
+                               fetch=_make_fetch({}, b""), read=lambda _p: None,
+                               now="2026-09-13T00:00:00Z")
+        self.assertEqual(code, 0)
+        self.assertEqual(seen["data_root"], root)
+        self.assertEqual(seen["satellites"], ["g18", "g19"])
+        self.assertEqual(seen["latency_days"], 3)
+        self.assertEqual(seen["max_days"], 7)
 
 
 def _read(path):
