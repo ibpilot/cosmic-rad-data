@@ -65,6 +65,9 @@ NCEI_LATENCY_DAYS = 2
 # cubre el primer bloque cronologico y la siguiente continua en el dia inmediato
 # posterior, sin saltar dias (idempotente y resumible).
 CATCHUP_MAX_DAYS = 30
+# Presupuesto de tiempo de una pasada de catch-up. El workflow corta el paso a
+# los 8 min; parar antes deja el manifiesto escrito con lo ya importado.
+CATCHUP_DEADLINE_S = 360
 
 TIME_VARS = ("time", "L2_SciData_TimeStamp")
 YAW_VARS = ("yaw_flip_flag", "YawFlipFlag")
@@ -108,6 +111,7 @@ class ImportReport:
         self.days_complete = 0
         self.days_partial = 0
         self.days_missing = 0
+        self.timed_out = False
 
 
 # ---------------------------------------------------------------------------
@@ -895,14 +899,21 @@ def catchup_range(data_root, now, satellites=None,
 
 
 def import_range(data_root, start_day, end_day, satellites, fetch,
-                 now, read=None, sleep=None, dry_run=False, resume=False):
+                 now, read=None, sleep=None, dry_run=False, resume=False,
+                 deadline_s=None, clock=None):
     """Importa el rango inclusivo. Fallos por satélite se registran y se sigue."""
     if start_day > end_day:
         raise ValueError("start_day > end_day")
     read = read or read_netcdf
     sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    t0 = clock()
     generated_at = _fmt_now(now)
     report = ImportReport()
+
+    def out_of_time():
+        return deadline_s is not None and clock() - t0 > deadline_s
+
     days = day_range(start_day, end_day)
     report.days_requested = len(days)
     day_set = set(days)
@@ -912,6 +923,9 @@ def import_range(data_root, start_day, end_day, satellites, fetch,
     for year, month in month_iter(start_day, end_day):
         month_days = [d for d in days if d.startswith("%04d-%02d" % (year, month))]
         for sat in satellites:
+            if out_of_time():
+                report.timed_out = True
+                break
             url = listing_url(sat, year, month)
             try:
                 body = download(url, fetch, sleep)
@@ -925,9 +939,14 @@ def import_range(data_root, start_day, end_day, satellites, fetch,
                 day = _day_of_str(name)
                 if day in day_set and sat_of(name) == sat:
                     names_by.setdefault((sat, day), []).append(name)
+        if report.timed_out:
+            break
 
     for day in days:
         for sat in satellites:
+            if out_of_time():
+                report.timed_out = True
+                break
             if (sat, day) in failed:
                 continue
             names = names_by.get((sat, day))
@@ -995,6 +1014,8 @@ def import_range(data_root, start_day, end_day, satellites, fetch,
                 report.files_created += 1
             else:
                 report.already_present += 1
+        if report.timed_out:
+            break
 
     if not dry_run:
         previous = read_json(
@@ -1045,6 +1066,8 @@ def _print_report(report, args, satellites):
         print("modo: dry-run (sin escrituras)")
     if args.resume or getattr(args, "catch_up", False):
         print("modo: resume")
+    if report.timed_out:
+        print("presupuesto de tiempo agotado: la siguiente pasada continua")
     for sat, day, reason in report.errors:
         print("error: %s %s: %s" % (sat, day, reason), file=sys.stderr)
 
@@ -1067,6 +1090,7 @@ def main(argv, fetch=None, read=None, now=None):
     parser.add_argument("--satellites", default=",".join(DEFAULT_SATELLITES))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--deadline-s", type=float, default=None)
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
@@ -1100,7 +1124,9 @@ def main(argv, fetch=None, read=None, now=None):
         report = import_range(
             args.data_root, args.start_day, args.end_day, satellites,
             fetch or http_get, now, read=read,
-            dry_run=args.dry_run, resume=resume)
+            dry_run=args.dry_run, resume=resume,
+            deadline_s=(args.deadline_s if args.deadline_s is not None
+                        else (CATCHUP_DEADLINE_S if args.catch_up else None)))
     except ValueError as exc:
         print("argumentos inválidos: %s" % exc, file=sys.stderr)
         return 1

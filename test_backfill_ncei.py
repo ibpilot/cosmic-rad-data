@@ -789,6 +789,113 @@ class BackfillTest(unittest.TestCase):
         self.assertEqual(seen["latency_days"], 3)
         self.assertEqual(seen["max_days"], 7)
 
+    # -- T37 ----------------------------------------------------------------
+    def test_t37_deadline_para_y_escribe_manifiesto(self):
+        root = tempfile.mkdtemp()
+        days = ("2026-09-10", "2026-09-11", "2026-09-12")
+        fetch, clock, read = _make_deadline_fetch(days)
+        report = bf.import_range(
+            root, days[0], days[-1], ["g18"], fetch, "2026-09-13T00:00:00Z",
+            read=read, sleep=lambda _s: None, deadline_s=10, clock=clock)
+        self.assertTrue(report.timed_out)
+        self.assertEqual(report.files_created, 1)
+        mpath = os.path.join(root, "ncei", "manifest.json")
+        self.assertTrue(os.path.exists(mpath))
+        manifest = bf.read_json(mpath)
+        self.assertIn(days[0], manifest["days"])
+        self.assertNotIn(days[1], manifest["days"])
+        self.assertNotIn(days[2], manifest["days"])
+
+    # -- T38 ----------------------------------------------------------------
+    def test_t38_sin_deadline_importa_todo(self):
+        root = tempfile.mkdtemp()
+        days = ("2026-09-10", "2026-09-11", "2026-09-12")
+        fetch, clock, read = _make_deadline_fetch(days)
+        report = bf.import_range(
+            root, days[0], days[-1], ["g18"], fetch, "2026-09-13T00:00:00Z",
+            read=read, sleep=lambda _s: None, deadline_s=None, clock=clock)
+        self.assertFalse(report.timed_out)
+        self.assertEqual(report.files_created, 3)
+
+    # -- T40 ----------------------------------------------------------------
+    def test_t40_deadline_corta_ya_en_los_listings(self):
+        # Presupuesto agotado desde el principio: ni siquiera se pide un
+        # listing (un NCEI colgado en los listings es el caso que mata el job).
+        root = tempfile.mkdtemp()
+        days = ("2026-09-10", "2026-09-11")
+        calls = []
+        ticks = iter([0])
+
+        def clock():
+            return next(ticks, 1000)
+
+        report = bf.import_range(
+            root, days[0], days[-1], ["g18"], lambda url: calls.append(url),
+            "2026-09-13T00:00:00Z", read=lambda _p: None,
+            sleep=lambda _s: None, deadline_s=10, clock=clock)
+        self.assertTrue(report.timed_out)
+        self.assertEqual(calls, [])
+        self.assertTrue(os.path.exists(os.path.join(root, "ncei", "manifest.json")))
+
+    # -- T39 ----------------------------------------------------------------
+    def test_t39_main_catchup_pasa_deadline_por_defecto(self):
+        root = tempfile.mkdtemp()
+        seen = {}
+
+        def fake_import(*args, **kwargs):
+            seen.update(kwargs)
+            return bf.ImportReport()
+
+        with mock.patch.object(bf, "import_range", fake_import):
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                code = bf.main([root, "--catch-up", "--satellites", "g18"],
+                               fetch=_make_fetch({}, b""),
+                               read=lambda _p: None,
+                               now="2026-09-13T00:00:00Z")
+        self.assertEqual(code, 0)
+        self.assertEqual(seen["deadline_s"], bf.CATCHUP_DEADLINE_S)
+
+        seen.clear()
+        with mock.patch.object(bf, "import_range", fake_import):
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                code = bf.main([root, "--from", DAY, "--to", DAY],
+                               fetch=_make_fetch({}, b""),
+                               read=lambda _p: None,
+                               now="2026-09-13T00:00:00Z")
+        self.assertEqual(code, 0)
+        self.assertIsNone(seen["deadline_s"])
+
+
+def _make_deadline_fetch(days):
+    """Fetch/clock/read de un rango de `days`, para los tests de deadline.
+
+    El fetch falso sirve el listing de los `days` y, al servir un `.nc`,
+    incrementa `served`; el clock salta a 1000 en cuanto se ha descargado el
+    primer fichero de datos (0 mientras no haya ninguno).
+    """
+    html = "".join('<a href="sci_sgps-l2-avg5m_g18_d%s_v3-0-3.nc">x</a>'
+                   % d.replace("-", "") for d in days)
+    state = {"served": 0}
+
+    def fetch(url):
+        if url.endswith("/"):
+            return html.encode("utf-8")
+        state["served"] += 1
+        name = url.rsplit("/", 1)[-1]
+        return ("NC-%s" % bf.day_of(name).isoformat()).encode("utf-8")
+
+    def clock():
+        return 1000 if state["served"] else 0
+
+    def read(path):
+        with open(path, "r", encoding="utf-8") as fh:
+            token = fh.read()
+        return make_raw(day=token.split("-", 1)[1], sat="g18")
+
+    return fetch, clock, read
+
 
 def _read(path):
     with open(path, "rb") as fh:

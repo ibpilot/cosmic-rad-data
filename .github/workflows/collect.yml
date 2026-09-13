@@ -8,22 +8,28 @@ on:
   workflow_dispatch:
 
 permissions:
-  # El bot necesita escribir en el repo para commitear solar/ y manifest.json.
-  contents: write
+  contents: read
 
 concurrency:
   group: collect
-  cancel-in-progress: true
+  # Cancelar una corrida en curso pierde su captura SWPC: se encola, no se cancela.
+  cancel-in-progress: false
 
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    permissions:
+      # Solo este job escribe: commitea solar/, ncei/ y manifest.json.
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (pin S2)
-        # Sin persist-credentials: false: el push del bot usa el GITHUB_TOKEN
-        # por defecto, que ya tiene permiso de escritura (contents: write).
+        with:
+          # El token no se guarda en .git/config: el codigo de terceros (h5py,
+          # numpy, libhdf5 leyendo NetCDF de NCEI) no lo puede leer. Se inyecta
+          # solo en los pasos de push.
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5 (pin S2)
@@ -31,30 +37,64 @@ jobs:
           python-version: "3.12"
 
       - name: Run collector
+        # Solo stdlib: no instala nada de terceros.
         run: python3 collect.py .
+
+      - name: Commit y push SWPC (antes de ejecutar codigo de terceros)
+        # La captura SWPC es la irreversible (ventana de 7 dias): se publica ya,
+        # asi un cuelgue o fallo del paso NCEI no la puede perder.
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "cosmic-rad-data bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- solar manifest.json
+          if git diff --cached --quiet; then
+            echo "Sin cambios en solar/ ni manifest.json."
+            exit 0
+          fi
+          git -c core.hooksPath=/dev/null commit -m "colector: actualizar archivo solar"
+          for i in 1 2 3; do
+            git -c core.hooksPath=/dev/null pull --rebase origin main && \
+            git -c core.hooksPath=/dev/null push "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main && exit 0
+            sleep $((i * 10))
+          done
+          exit 1
 
       - name: NCEI catch-up (incremental y acotado)
         # Extiende ncei/ desde el dia siguiente al ultimo importado hasta el
         # ultimo que NCEI ya deberia haber publicado (hoy - latencia). Es
-        # idempotente y reanudable: los dias ya presentes no se reescriben, y un
-        # dia que aun no este se reintenta en la pasada siguiente. No bloquea el
-        # archivo SWPC (la ventana irreversible): si NCEI falla, el paso queda en
-        # rojo pero el commit de abajo publica igual lo recogido.
+        # idempotente y reanudable. Corre SIN token. El timeout de paso (no el
+        # del job) con continue-on-error deja seguir al job si NCEI se cuelga;
+        # backfill_ncei.py ademas se corta solo por presupuesto de tiempo.
         continue-on-error: true
+        timeout-minutes: 8
         run: |
-          python3 -m pip install --quiet h5py
+          python3 -m pip install --quiet --require-hashes -r requirements-ncei.txt
           python3 backfill_ncei.py . --catch-up --satellites g18,g19
 
-      - name: Commit and push
+      - name: Commit y push NCEI (solo JSON bajo ncei/)
+        env:
+          TOKEN: ${{ github.token }}
         run: |
-          git config user.name "cosmic-rad-data bot"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # -A: en la primera corrida solar/ puede no existir todavia y un
-          # 'git add solar' con pathspec inexistente aborta el job.
-          git add -A
-          if git diff --cached --quiet; then
-            echo "Sin cambios en solar/ ni ncei/; no hay commit."
-          else
-            git commit -m "colector: actualizar archivo solar y NCEI"
-            git push
+          # El paso anterior ejecuto codigo de terceros: cualquier cambio fuera
+          # de ncei/*.json (p. ej. un .html plantado, que Pages serviria en el
+          # origen de la app) aborta sin publicar nada.
+          if git status --porcelain --untracked-files=all | grep -vE '^(\?\?| M) ncei/[A-Za-z0-9_./-]+\.json$'; then
+            echo "::error::cambios inesperados fuera de ncei/*.json; no se publica"
+            exit 1
           fi
+          git add -- ncei
+          if git diff --cached --quiet; then
+            echo "Sin cambios en ncei/."
+            exit 0
+          fi
+          # hooksPath=/dev/null: un hook plantado en .git/hooks no se ejecuta
+          # con el token en el entorno.
+          git -c core.hooksPath=/dev/null commit -m "colector: actualizar NCEI"
+          for i in 1 2 3; do
+            git -c core.hooksPath=/dev/null pull --rebase origin main && \
+            git -c core.hooksPath=/dev/null push "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main && exit 0
+            sleep $((i * 10))
+          done
+          exit 1
