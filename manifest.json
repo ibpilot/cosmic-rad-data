@@ -43,12 +43,13 @@
       "2026-10-10",
       "2026-10-11",
       "2026-10-12",
-      "2026-10-13"
+      "2026-10-13",
+      "2026-10-14"
     ],
-    "days_complete": 42,
+    "days_complete": 43,
     "days_incomplete": 4,
     "first_day": "2026-08-30",
-    "last_day": "2026-10-13"
+    "last_day": "2026-10-14"
   },
   "differential": {
     "collector_version": "1.1.0",
@@ -95,12 +96,13 @@
         "2026-10-10",
         "2026-10-11",
         "2026-10-12",
-        "2026-10-13"
+        "2026-10-13",
+        "2026-10-14"
       ],
-      "days_complete": 42,
+      "days_complete": 43,
       "days_incomplete": 4,
       "first_day": "2026-08-30",
-      "last_day": "2026-10-13"
+      "last_day": "2026-10-14"
     },
     "incomplete_days": [
       {
@@ -142,7 +144,7 @@
       }
     ],
     "last_error": null,
-    "last_success": "2026-10-14T21:27:48Z",
+    "last_success": "2026-10-15T04:03:00Z",
     "satellites": {
       "primary": 18,
       "secondary": 19
@@ -152,7 +154,7 @@
       19
     ],
     "schema_version": 1,
-    "updated_at": "2026-10-14T21:27:48Z",
+    "updated_at": "2026-10-15T04:03:00Z",
     "version": "1.1.0"
   },
   "incomplete_days": [
@@ -195,7 +197,7 @@
     }
   ],
   "last_error": null,
-  "last_success": "2026-10-14T21:27:48Z",
+  "last_success": "2026-10-15T04:03:00Z",
   "satellites": {
     "primary": 18,
     "secondary": 19
@@ -205,6 +207,6 @@
     19
   ],
   "schema_version": 1,
-  "updated_at": "2026-10-14T21:27:48Z",
+  "updated_at": "2026-10-15T04:03:00Z",
   "version": "1.1.0"
 }
